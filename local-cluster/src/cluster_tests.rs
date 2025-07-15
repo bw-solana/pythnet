@@ -7,7 +7,7 @@ use {
     rand::{thread_rng, Rng},
     rayon::prelude::*,
     solana_client::{connection_cache::ConnectionCache, thin_client::ThinClient},
-    solana_core::consensus::VOTE_THRESHOLD_DEPTH,
+    solana_core::consensus::VOTE_THRESHOLD_DEPTH_3,
     solana_entry::entry::{Entry, EntrySlice},
     solana_gossip::{
         cluster_info,
@@ -83,7 +83,7 @@ pub fn spend_and_verify_all_nodes<S: ::std::hash::BuildHasher + Sync + Send>(
             .unwrap();
         let mut transaction =
             system_transaction::transfer(funding_keypair, &random_keypair.pubkey(), 1, blockhash);
-        let confs = VOTE_THRESHOLD_DEPTH + 1;
+        let confs = VOTE_THRESHOLD_DEPTH_3 + 1;
         let sig = client
             .retry_transfer_until_confirmed(funding_keypair, &mut transaction, 10, confs)
             .unwrap();
@@ -272,7 +272,7 @@ pub fn kill_entry_and_spend_and_verify_rest(
                 blockhash,
             );
 
-            let confs = VOTE_THRESHOLD_DEPTH + 1;
+            let confs = VOTE_THRESHOLD_DEPTH_3 + 1;
             let sig = {
                 let sig = client.retry_transfer_until_confirmed(
                     funding_keypair,

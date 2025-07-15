@@ -3,6 +3,7 @@ use {
         heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice,
         latest_validator_votes_for_frozen_banks::LatestValidatorVotesForFrozenBanks,
         progress_map::{LockoutIntervals, ProgressMap},
+        replay_stage::DUPLICATE_THRESHOLD,
         tower1_7_14::Tower1_7_14,
         tower_storage::{SavedTower, SavedTowerVersions, TowerStorage},
     },
@@ -116,7 +117,18 @@ impl SwitchForkDecision {
     }
 }
 
-pub const VOTE_THRESHOLD_DEPTH: usize = 8;
+// Try to balance between "don't slow down the cluster if votes are a little bit
+// delayed" vs. "stop voting before I get locked out for a long time if the
+// cluster isn't with me."
+const VOTE_THRESHOLD_DEPTH_1: usize = 4;
+// We can hold an even higher bar for stake threshold when we go back to the
+// previous leader because the chances of a partition that we haven't observed
+// are lower and the leader transition will have provided even more time for
+// votes to land.
+const VOTE_THRESHOLD_DEPTH_2: usize = 5;
+// This is the ultra conservative threshold that we use to ensure that we don't
+// face insanely long lockouts.
+pub const VOTE_THRESHOLD_DEPTH_3: usize = 8;
 pub const SWITCH_FORK_THRESHOLD: f64 = 0.38;
 
 pub type Result<T> = std::result::Result<T, TowerError>;
@@ -200,7 +212,7 @@ impl Default for Tower {
     fn default() -> Self {
         let mut tower = Self {
             node_pubkey: Pubkey::default(),
-            threshold_depth: VOTE_THRESHOLD_DEPTH,
+            threshold_depth: VOTE_THRESHOLD_DEPTH_3,
             threshold_size: VOTE_THRESHOLD_SIZE,
             vote_state: VoteState::default(),
             last_vote: VoteTransaction::from(VoteStateUpdate::default()),
@@ -990,7 +1002,60 @@ impl Tower {
         self.last_switch_threshold_check.is_none()
     }
 
-    pub fn check_vote_stake_threshold(
+    /// Checks a single vote threshold for `slot`
+    fn check_vote_stake_threshold(
+        threshold_vote: Option<&Lockout>,
+        vote_state_before_applying_vote: &VoteState,
+        threshold_depth: usize,
+        threshold_size: f64,
+        slot: Slot,
+        voted_stakes: &HashMap<Slot, u64>,
+        total_stake: u64,
+    ) -> bool {
+        let threshold_vote = if threshold_vote.is_some() {
+            *threshold_vote.unwrap()
+        } else {
+            // Tower isn't that deep.
+            return true;
+        };
+
+        let fork_stake = if voted_stakes.get(&threshold_vote.slot).is_some() {
+            voted_stakes.get(&threshold_vote.slot).unwrap()
+        } else {
+            // We haven't seen any votes on this fork yet, so no stake
+            return false;
+        };
+
+        let lockout = *fork_stake as f64 / total_stake as f64;
+        trace!(
+            "fork_stake slot: {}, threshold_vote slot: {}, lockout: {} fork_stake: {} total_stake: {}",
+            slot,
+            threshold_vote.slot,
+            lockout,
+            fork_stake,
+            total_stake
+        );
+        if threshold_vote.confirmation_count as usize > threshold_depth {
+            for old_vote in &vote_state_before_applying_vote.votes {
+                if old_vote.slot == threshold_vote.slot
+                    && old_vote.confirmation_count == threshold_vote.confirmation_count
+                {
+                    // If you bounce back to voting on the main fork after not
+                    // voting for a while, your latest vote N on the main fork
+                    // might pop off a lot of the stake of votes in the tower.
+                    // This stake would have rolled up to earlier votes in the
+                    // tower, so skip the stake check.
+                    return true;
+                }
+            }
+        }
+        if lockout > threshold_size {
+            return true;
+        }
+        false
+    }
+
+    pub fn check_vote_stake_thresholds(
         &self,
         slot: Slot,
         voted_stakes: &VotedStakes,
@@ -998,30 +1063,35 @@ impl Tower {
     ) -> bool {
         let mut vote_state = self.vote_state.clone();
         vote_state.process_slot_vote_unchecked(slot);
-        let vote = vote_state.nth_recent_vote(self.threshold_depth);
-        if let Some(vote) = vote {
-            if let Some(fork_stake) = voted_stakes.get(&vote.slot) {
-                let lockout = *fork_stake as f64 / total_stake as f64;
-                trace!(
-                    "fork_stake slot: {}, vote slot: {}, lockout: {} fork_stake: {} total_stake: {}",
-                    slot, vote.slot, lockout, fork_stake, total_stake
-                );
-                if vote.confirmation_count as usize > self.threshold_depth {
-                    for old_vote in &self.vote_state.votes {
-                        if old_vote.slot == vote.slot
-                            && old_vote.confirmation_count == vote.confirmation_count
-                        {
-                            return true;
-                        }
-                    }
-                }
-                lockout > self.threshold_size
-            } else {
-                false
+        // Assemble all the vote thresholds and depths to check.
+        let vote_thresholds_and_depths = vec![
+            // Make sure there is at least enough stake voting with us that the
+            // rest of the cluster could switch onto this fork if it needs to.
+            (VOTE_THRESHOLD_DEPTH_1, SWITCH_FORK_THRESHOLD),
+            // Make sure there is at least enough stake voting with us that the
+            // cluster could confirm this block in a malicious duplicate block
+            // scenario.
+            (VOTE_THRESHOLD_DEPTH_2, DUPLICATE_THRESHOLD),
+            // Make sure there is at least enough stake voting with us to
+            // confirm this block.
+            (self.threshold_depth, self.threshold_size),
+        ];
+        // Check one by one. If any threshold fails, return failure.
+        for (threshold_depth, threshold_size) in vote_thresholds_and_depths {
+            if !Self::check_vote_stake_threshold(
+                vote_state.nth_recent_vote(threshold_depth),
+                &self.vote_state,
+                threshold_depth,
+                threshold_size,
+                slot,
+                voted_stakes,
+                total_stake,
+            ) {
+                return false;
             }
-        } else {
-            true
         }
+
+        true
     }
 
     /// Update lockouts for all the ancestors
@@ -2218,7 +2288,7 @@ pub mod test {
     fn test_check_vote_threshold_without_votes() {
         let tower = Tower::new_for_tests(1, 0.67);
         let stakes = vec![(0, 1)].into_iter().collect();
-        assert!(tower.check_vote_stake_threshold(0, &stakes, 2));
+        assert!(tower.check_vote_stake_thresholds(0, &stakes, 2));
     }
 
     #[test]
@@ -2230,7 +2300,7 @@ pub mod test {
             stakes.insert(i, 1);
             tower.record_vote(i, Hash::default());
         }
-        assert!(!tower.check_vote_stake_threshold(MAX_LOCKOUT_HISTORY as u64 + 1, &stakes, 2,));
+        assert!(!tower.check_vote_stake_thresholds(MAX_LOCKOUT_HISTORY as u64 + 1, &stakes, 2,));
     }
 
     #[test]
@@ -2345,14 +2415,14 @@ pub mod test {
         let mut tower = Tower::new_for_tests(1, 0.67);
         let stakes = vec![(0, 1)].into_iter().collect();
         tower.record_vote(0, Hash::default());
-        assert!(!tower.check_vote_stake_threshold(1, &stakes, 2));
+        assert!(!tower.check_vote_stake_thresholds(1, &stakes, 2));
     }
     #[test]
     fn test_check_vote_threshold_above_threshold() {
         let mut tower = Tower::new_for_tests(1, 0.67);
         let stakes = vec![(0, 2)].into_iter().collect();
         tower.record_vote(0, Hash::default());
-        assert!(tower.check_vote_stake_threshold(1, &stakes, 2));
+        assert!(tower.check_vote_stake_thresholds(1, &stakes, 2));
     }
 
     #[test]
@@ -2362,7 +2432,7 @@ pub mod test {
         tower.record_vote(0, Hash::default());
         tower.record_vote(1, Hash::default());
         tower.record_vote(2, Hash::default());
-        assert!(tower.check_vote_stake_threshold(6, &stakes, 2));
+        assert!(tower.check_vote_stake_thresholds(6, &stakes, 2));
     }
 
     #[test]
@@ -2370,7 +2440,7 @@ pub mod test {
         let mut tower = Tower::new_for_tests(1, 0.67);
         let stakes = HashMap::new();
         tower.record_vote(0, Hash::default());
-        assert!(!tower.check_vote_stake_threshold(1, &stakes, 2));
+        assert!(!tower.check_vote_stake_thresholds(1, &stakes, 2));
     }
 
     #[test]
@@ -2381,7 +2451,7 @@ pub mod test {
         tower.record_vote(0, Hash::default());
         tower.record_vote(1, Hash::default());
         tower.record_vote(2, Hash::default());
-        assert!(tower.check_vote_stake_threshold(6, &stakes, 2,));
+        assert!(tower.check_vote_stake_thresholds(6, &stakes, 2,));
     }
 
     #[test]
@@ -2457,7 +2527,7 @@ pub mod test {
     #[test]
     fn test_check_vote_threshold_forks() {
         // Create the ancestor relationships
-        let ancestors = (0..=(VOTE_THRESHOLD_DEPTH + 1) as u64)
+        let ancestors = (0..=(VOTE_THRESHOLD_DEPTH_3 + 1) as u64)
             .map(|slot| {
                 let slot_parents: HashSet<_> = (0..slot).collect();
                 (slot, slot_parents)
@@ -2465,25 +2535,25 @@ pub mod test {
             .collect();
 
         // Create votes such that
-        // 1) 3/4 of the stake has voted on slot: VOTE_THRESHOLD_DEPTH - 2, lockout: 2
-        // 2) 1/4 of the stake has voted on slot: VOTE_THRESHOLD_DEPTH, lockout: 2^9
+        // 1) 3/4 of the stake has voted on slot: VOTE_THRESHOLD_DEPTH_3 - 2, lockout: 2
+        // 2) 1/4 of the stake has voted on slot: VOTE_THRESHOLD_DEPTH_3, lockout: 2^9
         let total_stake = 4;
         let threshold_size = 0.67;
         let threshold_stake = (f64::ceil(total_stake as f64 * threshold_size)) as u64;
-        let tower_votes: Vec<Slot> = (0..VOTE_THRESHOLD_DEPTH as u64).collect();
+        let tower_votes: Vec<Slot> = (0..VOTE_THRESHOLD_DEPTH_3 as u64).collect();
         let accounts = gen_stakes(&[
-            (threshold_stake, &[(VOTE_THRESHOLD_DEPTH - 2) as u64]),
+            (threshold_stake, &[(VOTE_THRESHOLD_DEPTH_3 - 2) as u64]),
             (total_stake - threshold_stake, &tower_votes[..]),
         ]);
 
         // Initialize tower
-        let mut tower = Tower::new_for_tests(VOTE_THRESHOLD_DEPTH, threshold_size);
+        let mut tower = Tower::new_for_tests(VOTE_THRESHOLD_DEPTH_3, threshold_size);
 
         // CASE 1: Record the first VOTE_THRESHOLD tower votes for fork 2. We want to
-        // evaluate a vote on slot VOTE_THRESHOLD_DEPTH. The nth most recent vote should be
+        // evaluate a vote on slot VOTE_THRESHOLD_DEPTH_3. The nth most recent vote should be
         // for slot 0, which is common to all account vote states, so we should pass the
         // threshold check
-        let vote_to_evaluate = VOTE_THRESHOLD_DEPTH as u64;
+        let vote_to_evaluate = VOTE_THRESHOLD_DEPTH_3 as u64;
         for vote in &tower_votes {
             tower.record_vote(*vote, Hash::default());
         }
@@ -2499,12 +2569,12 @@ pub mod test {
             |_| None,
             &mut LatestValidatorVotesForFrozenBanks::default(),
         );
-        assert!(tower.check_vote_stake_threshold(vote_to_evaluate, &voted_stakes, total_stake,));
+        assert!(tower.check_vote_stake_thresholds(vote_to_evaluate, &voted_stakes, total_stake,));
 
-        // CASE 2: Now we want to evaluate a vote for slot VOTE_THRESHOLD_DEPTH + 1. This slot
+        // CASE 2: Now we want to evaluate a vote for slot VOTE_THRESHOLD_DEPTH_3 + 1. This slot
         // will expire the vote in one of the vote accounts, so we should have insufficient
         // stake to pass the threshold
-        let vote_to_evaluate = VOTE_THRESHOLD_DEPTH as u64 + 1;
+        let vote_to_evaluate = VOTE_THRESHOLD_DEPTH_3 as u64 + 1;
         let ComputedBankState {
             voted_stakes,
             total_stake,
@@ -2517,7 +2587,7 @@ pub mod test {
             |_| None,
             &mut LatestValidatorVotesForFrozenBanks::default(),
         );
-        assert!(!tower.check_vote_stake_threshold(vote_to_evaluate, &voted_stakes, total_stake,));
+        assert!(!tower.check_vote_stake_thresholds(vote_to_evaluate, &voted_stakes, total_stake,));
     }
 
     fn vote_and_check_recent(num_votes: usize) {

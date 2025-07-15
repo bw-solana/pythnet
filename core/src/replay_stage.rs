@@ -2944,8 +2944,11 @@ impl ReplayStage {
                 .get_fork_stats_mut(bank_slot)
                 .expect("All frozen banks must exist in the Progress map");
 
-            stats.vote_threshold =
-                tower.check_vote_stake_threshold(bank_slot, &stats.voted_stakes, stats.total_stake);
+            stats.vote_threshold = tower.check_vote_stake_thresholds(
+                bank_slot,
+                &stats.voted_stakes,
+                stats.total_stake,
+            );
             stats.is_locked_out = tower.is_locked_out(
                 bank_slot,
                 ancestors
