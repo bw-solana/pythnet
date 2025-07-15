@@ -2417,6 +2417,111 @@ pub mod test {
         tower.record_vote(0, Hash::default());
         assert!(!tower.check_vote_stake_thresholds(1, &stakes, 2));
     }
+
+    #[test]
+    fn test_check_vote_threshold_below_threshold_1() {
+        let mut tower = Tower::new_for_tests(8, 0.67);
+        let stakes = vec![
+            (0, 10),
+            (1, 9),
+            (2, 8),
+            (3, 7),
+            (4, 3),
+            (5, 3),
+            (6, 3),
+            (7, 3),
+        ]
+        .into_iter()
+        .collect();
+        tower.record_vote(0, Hash::default());
+        tower.record_vote(1, Hash::default());
+        tower.record_vote(2, Hash::default());
+        tower.record_vote(3, Hash::default());
+        tower.record_vote(4, Hash::default());
+        tower.record_vote(5, Hash::default());
+        tower.record_vote(6, Hash::default());
+        tower.record_vote(7, Hash::default());
+        assert!(!tower.check_vote_stake_thresholds(8, &stakes, 10));
+    }
+
+    #[test]
+    fn test_check_vote_threshold_below_threshold_2() {
+        let mut tower = Tower::new_for_tests(8, 0.67);
+        let stakes = vec![
+            (0, 10),
+            (1, 9),
+            (2, 8),
+            (3, 5),
+            (4, 4),
+            (5, 3),
+            (6, 3),
+            (7, 3),
+        ]
+        .into_iter()
+        .collect();
+        tower.record_vote(0, Hash::default());
+        tower.record_vote(1, Hash::default());
+        tower.record_vote(2, Hash::default());
+        tower.record_vote(3, Hash::default());
+        tower.record_vote(4, Hash::default());
+        tower.record_vote(5, Hash::default());
+        tower.record_vote(6, Hash::default());
+        tower.record_vote(7, Hash::default());
+        assert!(!tower.check_vote_stake_thresholds(8, &stakes, 10));
+    }
+
+    #[test]
+    fn test_check_vote_threshold_below_threshold_3() {
+        let mut tower = Tower::new_for_tests(8, 0.67);
+        let stakes = vec![
+            (0, 6),
+            (1, 6),
+            (2, 6),
+            (3, 6),
+            (4, 4),
+            (5, 3),
+            (6, 3),
+            (7, 3),
+        ]
+        .into_iter()
+        .collect();
+        tower.record_vote(0, Hash::default());
+        tower.record_vote(1, Hash::default());
+        tower.record_vote(2, Hash::default());
+        tower.record_vote(3, Hash::default());
+        tower.record_vote(4, Hash::default());
+        tower.record_vote(5, Hash::default());
+        tower.record_vote(6, Hash::default());
+        tower.record_vote(7, Hash::default());
+        assert!(!tower.check_vote_stake_thresholds(8, &stakes, 10));
+    }
+
+    #[test]
+    fn test_check_vote_threshold_above_thresholds() {
+        let mut tower = Tower::new_for_tests(8, 0.67);
+        let stakes = vec![
+            (0, 10),
+            (1, 9),
+            (2, 8),
+            (3, 7),
+            (4, 6),
+            (5, 5),
+            (6, 4),
+            (7, 3),
+        ]
+        .into_iter()
+        .collect();
+        tower.record_vote(0, Hash::default());
+        tower.record_vote(1, Hash::default());
+        tower.record_vote(2, Hash::default());
+        tower.record_vote(3, Hash::default());
+        tower.record_vote(4, Hash::default());
+        tower.record_vote(5, Hash::default());
+        tower.record_vote(6, Hash::default());
+        tower.record_vote(7, Hash::default());
+        assert!(tower.check_vote_stake_thresholds(8, &stakes, 10));
+    }
+
     #[test]
     fn test_check_vote_threshold_above_threshold() {
         let mut tower = Tower::new_for_tests(1, 0.67);
